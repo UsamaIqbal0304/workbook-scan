@@ -493,7 +493,10 @@ def main(argv):
         out.append(r)
     if as_json:
         print(json.dumps(out, indent=1))
-        return 0
+        # Same exit code as the text output. It returned 0 here for a week,
+        # which quietly broke the one thing the exit code is for: a release
+        # step that reads the JSON would never fail on a finding.
+        return 1 if any(r["findings"] for r in out) else 0
     for r in out:
         print("=" * 70)
         def n(count, word):
