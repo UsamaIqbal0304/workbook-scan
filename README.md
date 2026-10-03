@@ -6,9 +6,13 @@ connections, volatile functions, `INDIRECT`/`OFFSET`, approximate `VLOOKUP`,
 hidden sheets, formulas nothing protects, broken defined names, and the two
 cases where the file is not what its extension says.
 
-One Python file, standard library only - `zipfile` and `xml.etree`. A tool that
-asks someone to install a dependency before it can read their own file does not
-get run.
+It reads the old binary `.xls` as well, which is a different file format
+entirely - an OLE compound file holding a stream of BIFF records - so five of
+the rules work on a workbook saved in 1997.
+
+One Python file, standard library only - `zipfile`, `xml.etree` and `struct`.
+A tool that asks someone to install a dependency before it can read their own
+file does not get run.
 
 ```
 ./workbook-scan.py BOOK.xlsx [MORE.xlsx ...]
@@ -76,13 +80,47 @@ An `.xlsx` is a zip of XML. The program opens it as one and reads:
 It never opens Excel, never evaluates a formula, never writes to the file it
 reads, and nothing leaves the machine.
 
+## The old binary `.xls`
+
+A `.xls` is not a zip and `zipfile.is_zipfile` is not how to tell: that
+function hunts for an end-of-central-directory signature anywhere in the file,
+and a 64 KB binary workbook can contain those four bytes by coincidence. One
+did, on the first real `.xls` this program was pointed at, which came back as
+"not a workbook". The format is decided by the first eight bytes instead.
+
+What the program then parses, with no library:
+
+- the OLE compound file - header, FAT, the DIFAT chain for files too big for
+  the header's 109 entries, the directory, and the mini stream where parts
+  under 4096 bytes are packed - to get at the `Workbook` stream.
+- the BIFF record stream inside it, segmented by `BOF` so that a sheet
+  protection record is attributed to the sheet whose substream it is in. That
+  is what makes `unprotected-formulas` mean anything on a `.xls`.
+- `BOUNDSHEET` for sheet names and the hidden flag, `FORMULA` for the eight
+  byte cached result - where `0xFFFF` in the last two bytes says "not a
+  number" and a leading `2` says the saved answer was an error - `PROTECT`,
+  `FILEPASS` for an encrypted book, and `SUPBOOK` for an external file. A
+  `SUPBOOK` of `0x0401` or `0x3A01` is the workbook referring to itself or to
+  an add-in, not an external file, and reporting those would put a broken link
+  in every workbook that has a 3-D formula.
+- `SummaryInformation` - the `created` and `last-saved` timestamps, the
+  application that wrote it and the name it recorded, decoded with the code
+  page the property set names rather than assumed to be Latin-1. Those strings
+  are printed, never reported as a finding: every Office file has them. For a
+  spreadsheet somebody published for download, the last-saved date is usually
+  the most useful fact in the file.
+
 ## What it does not do
 
 - It does not grade a workbook or give it a score. Twelve rules, each either
   matched in the bytes or not.
-- It does not read `.xls` or `.xlsm` content. It says so and stops: those are
-  a different format and a VBA project, and pretending otherwise would be the
-  bug worth avoiding.
+- It does not read the *formulas* in a `.xls`, so `volatile`,
+  `fragile-reference` and `approximate-lookup` are `.xlsx`-only. BIFF stores a
+  formula as a token stream keyed by function index, and guessing those indices
+  would mean reporting findings the program cannot stand behind.
+- It does not run the VBA in an `.xlsm`. It reports that a VBA project is
+  there, which is the part that matters when the question is whether a browser
+  can ever do what the workbook does.
 - It does not tell you a finding is a defect. A volatile function is correct
   in a sheet that is meant to answer differently today; the finding is that
   the sheet does, not that it should not.
@@ -97,8 +135,18 @@ binaries, because a fixture nobody can read is not a fixture:
 ```
 
 writes `fixtures/dirty.xlsx` - one finding per rule, each in a cell you can go
-and look at - and `fixtures/clean.xlsx`, which has formulas, is protected, and
-reports nothing. Byte-identical on every run, so a diff means a real change.
+and look at - `fixtures/clean.xlsx`, which has formulas, is protected, and
+reports nothing, and `fixtures/dirty.xls`, which is the same idea written as a
+compound file and a BIFF stream by hand. Byte-identical on every run, so a diff
+means a real change.
+
+One honest limit on that last one. Its container is valid - `file` reports
+`CDFV2 Microsoft Excel` and 7-Zip will list the `Workbook` stream out of it -
+but the stream holds only the records these rules are about, and not the font,
+format and XF tables a spreadsheet application insists on, so LibreOffice
+declines to open it. It is a test of the reader, not a specimen workbook. To
+exercise the `.xls` path against something Excel would open, point the program
+at a real `.xls`.
 
 ## Running it
 
@@ -106,6 +154,7 @@ reports nothing. Byte-identical on every run, so a diff means a real change.
 $ ./make-workbook-fixtures.py
 dirty.xlsx       3503 bytes, 10 members
 clean.xlsx       1584 bytes, 5 members
+dirty.xls        2048 bytes, 1 members
 
 $ ./workbook-scan.py fixtures/dirty.xlsx
 ======================================================================
@@ -145,6 +194,24 @@ $ ./workbook-scan.py fixtures/clean.xlsx
 clean.xlsx  1584 bytes, 1 sheet, 2 cells, 1 formula
 ======================================================================
   nothing this scanner knows how to find.
+
+$ ./workbook-scan.py fixtures/dirty.xls
+======================================================================
+dirty.xls  2048 bytes, 2 sheets, 1 cell, 1 formula
+======================================================================
+  legacy-binary          1
+  hidden-sheet           1
+  cached-error           1
+  unprotected-formulas   1
+
+  legacy-binary  dirty.xls
+    this is the pre-2007 binary .xls format, so no browser-based tool opens it, newer Excel warns before it will, and every reader of it is working from a reverse engineered layout
+  hidden-sheet  Old rates
+    the sheet is marked hidden, so it does not appear in the tab bar and its rules are invisible to whoever uses the book
+  cached-error  Prices
+    1 cell in this sheet was saved holding #REF!, so the book was last used in that state
+  unprotected-formulas  Prices
+    the sheet carries 1 formula and has no protection, so anyone can type over a rule and nothing says so
 ```
 
 ## Licence

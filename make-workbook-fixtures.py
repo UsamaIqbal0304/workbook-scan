@@ -10,9 +10,19 @@ found a defect in belongs to somebody else.
 
     ./make-workbook-fixtures.py [OUTDIR]
 
-Writes dirty.xlsx (one finding per rule the scanner has) and clean.xlsx (a
-sheet with formulas, protected, nothing to report). Deterministic: same bytes
-every run, so a diff means a real change.
+Writes dirty.xlsx (one finding per rule the scanner has), clean.xlsx (a sheet
+with formulas, protected, nothing to report) and dirty.xls (the same idea in
+the old binary format). Deterministic: same bytes every run, so a diff means a
+real change.
+
+One honest limit on dirty.xls. Its OLE container is valid - `file` reads it as
+"CDFV2 Microsoft Excel" and 7z lists the Workbook stream out of it - but the
+BIFF stream inside carries only the records the scanner's rules are about, and
+not the font, format and XF tables a spreadsheet application insists on.
+LibreOffice therefore refuses to open it. That is fine for what it is, a test
+of the reader, and it is said here so nobody discovers it as a surprise: to
+check the .xls path against a file Excel would open, point the scanner at a
+real .xls.
 """
 import os
 import sys
@@ -165,3 +175,129 @@ CLEAN = rows([("A1", "<v>7</v>"), ("B1", "<f>A1*1.2</f><v>8.4</v>")],
              '<sheetProtection sheet="1"/>')
 write(os.path.join(out, "clean.xlsx"),
       book([("Sheet1", "visible", CLEAN)]))
+
+
+# --- the binary fixture --------------------------------------------------
+# workbook-scan reads .xls as well, and four of the five published
+# spreadsheets it has been pointed at were .xls, so that path needs a fixture
+# too. Writing one means writing both layers by hand: an OLE compound file
+# holding a stream of BIFF8 records. It is about sixty lines and it is the only
+# way a stranger can run the .xls rules without a file of somebody else's.
+import struct
+
+
+def biff(t, data=b""):
+    return struct.pack("<HH", t, len(data)) + data
+
+
+def bof(dt):
+    # vers 0x0600 is BIFF8. The build and year fields are what Excel 97 wrote;
+    # nothing reads them, but a plausible value beats zeros.
+    return biff(0x0809, struct.pack("<HHHHII", 0x0600, dt, 0x0DBB, 0x07CC,
+                                    0x000080C9, 0x00000206))
+
+
+def boundsheet(name, pos, state):
+    nm = name.encode("utf-16-le")
+    return biff(0x0085, struct.pack("<iHBB", pos, state, len(name), 0x01) + nm)
+
+
+def formula_error(row, col, code):
+    # The cached result is eight bytes: a type byte, the error code, and
+    # 0xFFFF in the last two to say "this is not a number".
+    result = struct.pack("<BBBxxxBB", 0x02, 0x00, code, 0xFF, 0xFF)
+    rgce = struct.pack("<BHH", 0x24, row, col)  # ptgRef, one cell
+    return biff(0x0006, struct.pack("<HHH", row, col, 15) + result
+                + struct.pack("<HIH", 0x0002, 0, len(rgce)) + rgce)
+
+
+def xls_stream():
+    """The Workbook stream: globals, then one substream per sheet."""
+    sheets = [("Prices", 0x0000), ("Old rates", 0x0001)]
+    # Sheet 1 holds an unprotected formula whose saved answer was #REF!; sheet
+    # 2 is hidden. Between them that is every .xls rule the scanner has.
+    bodies = [bof(0x0010) + formula_error(1, 1, 0x17) + biff(0x000A),
+              bof(0x0010) + biff(0x0012, struct.pack("<H", 1)) + biff(0x000A)]
+    # lbPlyPos is an absolute offset into the stream, so the globals have to be
+    # built twice: once to learn their length, once with the real offsets.
+    for _ in range(2):
+        head = bof(0x0005)
+        head += b"".join(boundsheet(n, 0, st) for n, st in sheets)
+        head += biff(0x000A)
+        base = len(head)
+        offs, run = [], base
+        for b in bodies:
+            offs.append(run)
+            run += len(b)
+    out = bof(0x0005)
+    out += b"".join(boundsheet(n, offs[i], st)
+                    for i, (n, st) in enumerate(sheets))
+    out += biff(0x000A) + b"".join(bodies)
+    return out
+
+
+def ole(streams):
+    """An OLE compound file holding the given {name: bytes}, 512-byte sectors.
+
+    Every stream here is written as a full sector chain rather than through the
+    mini stream, which is legal and keeps this readable.
+    """
+    SZ, FREE, END = 512, -1, -2
+    names = list(streams)
+    data, starts = [], {}
+    for n in names:
+        starts[n] = len(data)
+        b = streams[n]
+        b += b"\0" * (-len(b) % SZ)
+        data += [b[i:i + SZ] for i in range(0, len(b), SZ)]
+    # Sector order: stream data, then the directory, then the FAT.
+    dir_start = len(data)
+    entries = [("Root Entry", 5, END, 0)] + [
+        (n, 2, starts[n], len(streams[n])) for n in names]
+    dirb = b""
+    for i, (n, typ, start, size) in enumerate(entries):
+        nm = n.encode("utf-16-le") + b"\0\0"
+        e = nm + b"\0" * (64 - len(nm))
+        e += struct.pack("<HBB", len(nm), typ, 1)        # name len, type, black
+        left = 1 if typ == 5 and entries[1:] else FREE   # root's child
+        e += struct.pack("<iii", FREE, FREE, left)
+        e += b"\0" * 16 + struct.pack("<I", 0) + b"\0" * 16  # clsid, state, ts
+        e += struct.pack("<iq", start, size)
+        dirb += e + b"\0" * (128 - len(e))
+    dirb += b"\0" * (-len(dirb) % SZ)
+    dirsecs = [dirb[i:i + SZ] for i in range(0, len(dirb), SZ)]
+    fat_start = dir_start + len(dirsecs)
+
+    fat = [END] * (fat_start + 1)
+    for n in names:
+        s = starts[n]
+        count = len(streams[n])
+        count = (count + SZ - 1) // SZ
+        for k in range(count - 1):
+            fat[s + k] = s + k + 1
+        fat[s + count - 1] = END
+    for k in range(len(dirsecs) - 1):
+        fat[dir_start + k] = dir_start + k + 1
+    fat[dir_start + len(dirsecs) - 1] = END
+    fat[fat_start] = -3  # the FAT sector itself
+    fat += [FREE] * (-len(fat) % (SZ // 4))
+    fatb = struct.pack("<%di" % len(fat), *fat)
+    fatsecs = [fatb[i:i + SZ] for i in range(0, len(fatb), SZ)]
+
+    difat = [fat_start + i for i in range(len(fatsecs))]
+    difat += [FREE] * (109 - len(difat))
+    head = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 16
+    head += struct.pack("<HHHHHH", 0x003E, 3, 0xFFFE, 9, 6, 0)
+    head += b"\0" * 4  # reserved is six bytes from 0x22, two of them above
+    head += struct.pack("<iiiiiiii", 0, len(fatsecs), dir_start, 0, 4096,
+                        END, 0, END)
+    head += struct.pack("<i", 0)
+    head += struct.pack("<109i", *difat)
+    head += b"\0" * (SZ - len(head))
+    return head + b"".join(data) + b"".join(dirsecs) + b"".join(fatsecs)
+
+
+path = os.path.join(out, "dirty.xls")
+with open(path, "wb") as f:
+    f.write(ole({"Workbook": xls_stream()}))
+print("%-14s %6d bytes, %d members" % ("dirty.xls", os.path.getsize(path), 1))

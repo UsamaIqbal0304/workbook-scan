@@ -35,13 +35,26 @@ that are in the bytes:
   legacy-macro        .xlsm/.xls content: VBA that no browser-based tool runs.
   defined-name-broken a named range pointing at #REF!.
 
+It reads the old binary .xls too, which is not a zip of XML but an OLE
+compound file holding a stream of BIFF records. Both layers are parsed here,
+so hidden-sheet, cached-error, unprotected-formulas, external-link and
+legacy-macro all work on a .xls, and the file's own created and last-saved
+timestamps get printed - a published spreadsheet's last-saved date is often
+the most useful fact in it. What does not work on .xls is volatile,
+fragile-reference and approximate-lookup: those need the formula text, and
+BIFF stores formulas as a token stream keyed by function index. Guessing those
+indices would mean reporting findings this tool cannot stand behind, so it
+does not claim them.
+
 Nothing is installed and nothing leaves the machine. Python standard library
-only - zipfile and xml.etree - because a tool that asks a stranger to install
-a dependency before it can read their own file will not get run.
+only - zipfile, xml.etree and struct - because a tool that asks a stranger to
+install a dependency before it can read their own file will not get run.
 """
+import datetime
 import json
 import os
 import re
+import struct
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
@@ -88,6 +101,249 @@ def _args(src, start):
     return out
 
 
+# --- the old binary format ----------------------------------------------
+# .xls is an OLE compound file holding a stream of BIFF records. Nothing in
+# the standard library reads either layer, so both are here: about a hundred
+# lines, and it means a published .xls gets a real answer instead of "this is
+# not a zip". Four of the five published spreadsheets this tool has been
+# pointed at in anger were .xls, so the shrug was most of the tool's output.
+OLE_SIG = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+# The error a formula was holding when the file was saved. BIFF stores it as a
+# code, not as text, so the mapping is the file format's and not a guess.
+BIFF_ERR = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!",
+            0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A"}
+# Property ids in the SummaryInformation stream. Reported, never a finding:
+# every Office file carries them, so they say nothing about the workbook's
+# quality - they say when it was last true, which is a different question.
+SI_PROPS = {4: "author", 8: "last-author", 12: "created", 13: "last-saved",
+            18: "application"}
+
+
+def _ole_streams(raw):
+    """{name: bytes} for every stream in an OLE compound file."""
+    ssz = 1 << struct.unpack_from("<H", raw, 0x1e)[0]
+    msz = 1 << struct.unpack_from("<H", raw, 0x20)[0]
+    nfat, dirstart, minicut, ministart, _nmini, difstart, ndif = \
+        struct.unpack_from("<ii4xiiiii", raw, 0x2c)
+
+    def at(n, size):
+        return 512 + n * size
+
+    # The FAT lives in sectors listed in the header, and past 109 of them in a
+    # chain of DIFAT sectors. Small files never need the chain; big ones do.
+    fatsecs = list(struct.unpack_from("<109i", raw, 0x4c))
+    nxt, left = difstart, ndif
+    while nxt >= 0 and left > 0:
+        block = struct.unpack_from("<%di" % (ssz // 4), raw, at(nxt, ssz))
+        fatsecs += list(block[:-1])
+        nxt, left = block[-1], left - 1
+    fat = []
+    for s in fatsecs[:nfat]:
+        if s < 0:
+            break
+        fat += list(struct.unpack_from("<%di" % (ssz // 4), raw, at(s, ssz)))
+
+    def chain(start, table):
+        out, n, seen = [], start, set()
+        while n >= 0 and n not in seen and n < len(table):
+            seen.add(n)
+            out.append(n)
+            n = table[n]
+        return out
+
+    def cat(start, size, table, sector):
+        return b"".join(raw[at(n, sector):at(n, sector) + sector]
+                        for n in chain(start, table))[:size]
+
+    dirb = b"".join(raw[at(n, ssz):at(n, ssz) + ssz]
+                    for n in chain(dirstart, fat))
+    entries = []
+    for i in range(0, len(dirb) - 127, 128):
+        e = dirb[i:i + 128]
+        nlen = struct.unpack_from("<H", e, 64)[0]
+        name = e[:max(0, nlen - 2)].decode("utf-16-le", "replace")
+        start, size = struct.unpack_from("<iq", e, 116)
+        if name:
+            entries.append({"name": name, "type": e[66], "start": start,
+                            "size": size})
+    # Streams under the mini cutoff are packed into one ordinary stream owned
+    # by the root entry, indexed by its own allocation table.
+    root = next((e for e in entries if e["type"] == 5), None)
+    mini, minifat = b"", []
+    if root and ministart >= 0:
+        mini = b"".join(raw[at(n, ssz):at(n, ssz) + ssz]
+                        for n in chain(root["start"], fat))
+        for n in chain(ministart, fat):
+            minifat += list(struct.unpack_from("<%di" % (ssz // 4), raw,
+                                               at(n, ssz)))
+    out = {}
+    for e in entries:
+        if e["type"] != 2:
+            continue
+        if e["size"] < minicut and minifat:
+            out[e["name"]] = b"".join(
+                mini[n * msz:(n + 1) * msz]
+                for n in chain(e["start"], minifat))[:e["size"]]
+        else:
+            out[e["name"]] = cat(e["start"], e["size"], fat, ssz)
+    return out, [e["name"] for e in entries]
+
+
+def _props(si):
+    """The SummaryInformation property set, as {label: value}."""
+    out = {}
+    try:
+        secoff = struct.unpack_from("<i", si, 44)[0]
+        nprops = struct.unpack_from("<i", si, secoff + 4)[0]
+    except struct.error:
+        return out
+    # Property 1 is the code page the byte strings in this set are written in.
+    # Reading them as latin-1 instead turned a Polish surname into mojibake,
+    # which is the kind of detail that makes a stranger stop trusting output.
+    enc = "cp1252"
+    for k in range(nprops):
+        try:
+            pid, off = struct.unpack_from("<ii", si, secoff + 8 + k * 8)
+        except struct.error:
+            break
+        if pid == 1:
+            cp = struct.unpack_from("<h", si, secoff + off + 4)[0]
+            enc = {65001: "utf-8"}.get(cp % 65536, "cp%d" % (cp % 65536))
+            try:
+                "".encode(enc)
+            except LookupError:
+                enc = "cp1252"
+    for k in range(nprops):
+        try:
+            pid, off = struct.unpack_from("<ii", si, secoff + 8 + k * 8)
+            base = secoff + off
+            typ = struct.unpack_from("<i", si, base)[0]
+        except struct.error:
+            continue
+        label = SI_PROPS.get(pid)
+        if not label:
+            continue
+        if typ == 64:  # FILETIME, 100ns ticks since 1601
+            ticks = struct.unpack_from("<Q", si, base + 4)[0]
+            if ticks:
+                out[label] = (datetime.datetime(1601, 1, 1) +
+                              datetime.timedelta(microseconds=ticks / 10)
+                              ).strftime("%Y-%m-%d %H:%M:%S")
+        elif typ == 30:  # byte string, NUL terminated
+            ln = struct.unpack_from("<i", si, base + 4)[0]
+            val = si[base + 8:base + 8 + max(0, ln - 1)]
+            val = val.decode(enc, "replace").strip("\x00").strip()
+            if val:
+                out[label] = val
+    return out
+
+
+def scan_xls(path, res, add):
+    raw = open(path, "rb").read()
+    try:
+        streams, names = _ole_streams(raw)
+    except (struct.error, IndexError, ValueError) as exc:
+        add("unreadable", "the file starts like an OLE compound document but "
+            "its allocation tables do not parse, so it is damaged or not "
+            "really a spreadsheet", str(exc))
+        return res
+    book = streams.get("Workbook") or streams.get("Book")
+    if book is None:
+        add("not-a-workbook", "the compound file holds no Workbook stream, so "
+            "whatever it is, it is not an Excel spreadsheet",
+            ", ".join(n for n in names if not n.startswith("\x05"))[:120])
+        return res
+
+    add("legacy-binary", "this is the pre-2007 binary .xls format, so no "
+        "browser-based tool opens it, newer Excel warns before it will, and "
+        "every reader of it is working from a reverse engineered layout",
+        os.path.basename(path))
+    if any(n.startswith("_VBA_PROJECT") or n == "Macros" for n in names):
+        add("legacy-macro", "the workbook contains a VBA project, so part of "
+            "what it does is code that only desktop Excel runs",
+            os.path.basename(path))
+    for key in names:
+        if key.endswith("SummaryInformation") and "Document" not in key:
+            res["props"] = _props(streams[key])
+
+    # One record stream: globals first, then one substream per sheet, each
+    # opened by a BOF. Sheet protection is a record inside a sheet's substream,
+    # so which substream we are in is what makes the protection check mean
+    # anything.
+    i, sheet, order = 0, None, []
+    cur = {"name": "(workbook globals)", "formulas": 0, "protected": False,
+           "errors": Counter()}
+    order.append(cur)
+    boundsheets = []
+    while i + 4 <= len(book):
+        t, n = struct.unpack_from("<HH", book, i)
+        d = book[i + 4:i + 4 + n]
+        if t == 0x0809 and i:  # BOF of a sheet substream
+            sheet = (boundsheets.pop(0) if boundsheets else "sheet")
+            cur = {"name": sheet, "formulas": 0, "protected": False,
+                   "errors": Counter()}
+            order.append(cur)
+        elif t == 0x0085 and len(d) > 8:  # BOUNDSHEET
+            grbit, cch, flags = struct.unpack_from("<HBB", d, 4)
+            nm = (d[8:8 + cch * 2].decode("utf-16-le", "replace") if flags & 1
+                  else d[8:8 + cch].decode("latin-1"))
+            boundsheets.append(nm)
+            state = {0: "visible", 1: "hidden", 2: "veryHidden"}.get(
+                grbit & 3, "visible")
+            res["sheets"].append({"name": nm, "state": state})
+            if state != "visible":
+                add("hidden-sheet", "the sheet is marked %s, so it does not "
+                    "appear in the tab bar and its rules are invisible to "
+                    "whoever uses the book" % state, nm)
+        elif t == 0x0006 and len(d) >= 20:  # FORMULA
+            cur["formulas"] += 1
+            res["formulas"] += 1
+            res["cells"] += 1
+            # A formula's cached result is eight bytes. When the last two are
+            # 0xFFFF it is not a number, and the first byte says what it is:
+            # 2 means the saved answer was an error.
+            if d[12] == 0xFF and d[13] == 0xFF and d[6] == 2:
+                cur["errors"][BIFF_ERR.get(d[8], "#?")] += 1
+        elif t in (0x00FD, 0x0204, 0x0203, 0x027E, 0x0205, 0x00BE):
+            res["cells"] += 1
+        elif t == 0x00BD and len(d) >= 6:  # MULRK, one record for many cells
+            res["cells"] += (len(d) - 6) // 6
+        elif t == 0x0012 and len(d) >= 2:  # PROTECT
+            if struct.unpack_from("<H", d, 0)[0]:
+                cur["protected"] = True
+        elif t == 0x002F:  # FILEPASS
+            add("encrypted", "the workbook is password protected, so nothing "
+                "below this line could be read out of it",
+                os.path.basename(path))
+            return res
+        elif t == 0x01AE and len(d) >= 4:  # SUPBOOK
+            cch = struct.unpack_from("<H", d, 2)[0]
+            # 0x0401 is the workbook's reference to itself and 0x3A01 an
+            # add-in. Neither is an external file, and treating them as one
+            # would report a broken link in every file that has a 3D formula.
+            if cch not in (0x0401, 0x3A01):
+                tgt = d[4:4 + cch * 2].decode("utf-16-le", "replace")
+                tgt = "".join(c if c.isprintable() else "/" for c in tgt)
+                add("external-link", "the workbook reads cells out of another "
+                    "file, so the answer depends on a file that may not exist "
+                    "any more", tgt.strip("/"))
+        i += 4 + n
+
+    for s in order:
+        for err, count in s["errors"].items():
+            add("cached-error", "%d cell%s in this sheet %s saved holding %s, "
+                "so the book was last used in that state"
+                % (count, "" if count == 1 else "s",
+                   "was" if count == 1 else "were", err), s["name"])
+        if s["formulas"] and not s["protected"]:
+            add("unprotected-formulas", "the sheet carries %d formula%s and "
+                "has no protection, so anyone can type over a rule and "
+                "nothing says so"
+                % (s["formulas"], "" if s["formulas"] == 1 else "s"),
+                s["name"])
+    return res
+
+
 def scan(path):
     name = os.path.basename(path)
     res = {"file": name, "bytes": os.path.getsize(path), "findings": [],
@@ -95,10 +351,16 @@ def scan(path):
     add = lambda rule, says, where="": res["findings"].append(
         {"rule": rule, "says": says, "where": where})
 
+    # The signature decides, not zipfile.is_zipfile: that one hunts for an end
+    # of central directory record anywhere in the file, and a 64 KB binary .xls
+    # can contain those four bytes by accident. It did, on the first real .xls
+    # this tool was pointed at, and the file came back "not a workbook".
+    head = open(path, "rb").read(8)
+    if head == OLE_SIG:
+        return scan_xls(path, res, add)
     if not zipfile.is_zipfile(path):
-        add("legacy-binary", "this is not a zip, so it is the old binary .xls "
-            "format - every tool that reads it is guessing at a reverse "
-            "engineered layout", name)
+        add("unreadable", "this is neither a zip nor an OLE compound file, so "
+            "it is not any version of an Excel workbook", name)
         return res
 
     z = zipfile.ZipFile(path)
@@ -239,6 +501,11 @@ def main(argv):
         print("%s  %s, %s, %s, %s"
               % (r["file"], n(r["bytes"], "byte"), n(len(r["sheets"]), "sheet"),
                  n(r["cells"], "cell"), n(r["formulas"], "formula")))
+        if r.get("props"):
+            print("  %s" % "  ".join(
+                "%s: %s" % (k, r["props"][k])
+                for k in ("created", "last-saved", "last-author", "application")
+                if k in r["props"]))
         print("=" * 70)
         if not r["findings"]:
             print("  nothing this scanner knows how to find.")
