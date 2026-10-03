@@ -1,10 +1,10 @@
 # workbook-scan
 
 What a spreadsheet actually does, read out of the file rather than out of Excel.
-Eleven things that are in the bytes: cached errors, external links, volatile
-functions, `INDIRECT`/`OFFSET`, approximate `VLOOKUP`, hidden sheets, formulas
-nothing protects, broken defined names, and the two cases where the file is not
-what its extension says.
+Twelve things that are in the bytes: cached errors, external links, saved data
+connections, volatile functions, `INDIRECT`/`OFFSET`, approximate `VLOOKUP`,
+hidden sheets, formulas nothing protects, broken defined names, and the two
+cases where the file is not what its extension says.
 
 One Python file, standard library only - `zipfile` and `xml.etree`. A tool that
 asks someone to install a dependency before it can read their own file does not
@@ -26,7 +26,7 @@ usually left. Before anyone offers to repair or replace one, the honest first
 step is to read what it already does - and that is a file-format question, not
 an opinion.
 
-Two of the eleven rules are worth the trouble on their own.
+Three of the twelve rules are worth the trouble on their own.
 
 **A cached error is not a cosmetic problem.** When a formula's last computed
 value is `#REF!`, Excel saves that error *into the file*, with the cell typed
@@ -45,6 +45,16 @@ commas, because `VLOOKUP(A6, Rates!$A$1:$D$99, MATCH(A5, Rates!$A$1:$D$1, 0))`
 has four commas and three arguments; this program splits arguments at the top
 level only.
 
+**A saved data connection outlives the machine that made it.**
+`xl/connections.xml` holds queries the workbook re-runs, and the path is in the
+file. This rule exists because six device profiles published for download by
+one manufacturer each still carried the same connection, named after a seventh
+device, pointing at a mapped drive: `N:\_Templates\...`. Nobody downloading
+those files can refresh them, and the path says more about how the files are
+built than anyone intended to publish. An external link and a connection are
+not the same finding - a link reads cells out of another file, a connection
+re-runs a query - so they are reported separately.
+
 ## What it reads, and where from
 
 An `.xlsx` is a zip of XML. The program opens it as one and reads:
@@ -59,13 +69,16 @@ An `.xlsx` is a zip of XML. The program opens it as one and reads:
   a cell that merely contains the text `#REF!` is not reported.
 - `xl/externalLinks/_rels/*.rels` - the real path of each external workbook,
   which is where the `/old-server/...` paths live.
+- `xl/connections.xml` - each saved query's name and source path, with a drive
+  letter, a UNC share or an absolute path reported as machine-specific and an
+  `https://` source reported as merely external.
 
 It never opens Excel, never evaluates a formula, never writes to the file it
 reads, and nothing leaves the machine.
 
 ## What it does not do
 
-- It does not grade a workbook or give it a score. Eleven rules, each either
+- It does not grade a workbook or give it a score. Twelve rules, each either
   matched in the bytes or not.
 - It does not read `.xls` or `.xlsm` content. It says so and stops: those are
   a different format and a VBA project, and pretending otherwise would be the
@@ -91,17 +104,18 @@ reports nothing. Byte-identical on every run, so a diff means a real change.
 
 ```
 $ ./make-workbook-fixtures.py
-dirty.xlsx       3136 bytes, 9 members
+dirty.xlsx       3503 bytes, 10 members
 clean.xlsx       1584 bytes, 5 members
 
 $ ./workbook-scan.py fixtures/dirty.xlsx
 ======================================================================
-dirty.xlsx  3136 bytes, 3 sheets, 9 cells, 7 formulas
+dirty.xlsx  3503 bytes, 3 sheets, 9 cells, 7 formulas
 ======================================================================
   cached-error           2
   hidden-sheet           1
   defined-name-broken    1
   external-link          1
+  data-connection        1
   volatile               1
   fragile-reference      1
   approximate-lookup     1
@@ -113,6 +127,8 @@ dirty.xlsx  3136 bytes, 3 sheets, 9 cells, 7 formulas
     the named range points at #REF!, so every formula using the name is already wrong
   external-link  /old-server/finance/rates-2014.xlsx
     the workbook reads cells out of another file, so the answer depends on a file that may not exist any more
+  data-connection  RatesTemplate -> N:\_Templates\rates\RatesTemplate.xml
+    the workbook carries a saved query to a path on one machine - a mapped drive or a share - so it refreshes for whoever set it up and for nobody else
   volatile  Pricing!B4
     the formula uses a volatile function, so the sheet answers differently tomorrow with no input changed
   fragile-reference  Pricing!B5

@@ -19,6 +19,10 @@ that are in the bytes:
   external-link       the workbook reads cells from another file. The path is
                       in the bytes, and it is usually on a machine nobody
                       has any more.
+  data-connection     a saved query to an external source. Not the same thing
+                      as an external link: this one re-runs, and when its path
+                      is a mapped drive or a share it refreshes for the person
+                      who built it and for nobody else.
   volatile            NOW, TODAY, RAND or RANDBETWEEN, so the sheet gives a
                       different answer tomorrow with no input changed.
   fragile-reference   INDIRECT or OFFSET, which survive no row insertion.
@@ -52,6 +56,10 @@ FRAGILE = re.compile(r"\b(INDIRECT|OFFSET)\s*\(", re.I)
 # approximate match. Counting commas inside the call is enough to tell, as
 # long as nested calls are not miscounted - so only the top level is split.
 LOOKUP = re.compile(r"\b([VH]LOOKUP)\s*\(", re.I)
+# A path that only exists on one machine: a drive letter, a UNC share, or a
+# POSIX absolute path. Deliberately not matching http(s), which is a source a
+# stranger's copy can actually still reach.
+LOCAL_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/)")
 
 
 def _args(src, start):
@@ -128,6 +136,33 @@ def scan(path):
                     add("external-link", "the workbook reads cells out of "
                         "another file, so the answer depends on a file that "
                         "may not exist any more", tgt)
+
+    # A saved query is not an external link: external links read cells out of
+    # another workbook, a connection re-runs a query against a source. Both
+    # carry a path, and the path is the part that outlives the machine.
+    # Found 4 Oct 2026 in six published device profiles that each still named
+    # one vendor's mapped drive, so the rule is here because a real file had it.
+    if "xl/connections.xml" in names:
+        for conn in ET.fromstring(z.read("xl/connections.xml")):
+            src = ""
+            for child in conn:
+                for attr in ("url", "sourceFile", "connection"):
+                    if child.get(attr):
+                        src = child.get(attr)
+                        break
+                if src:
+                    break
+            label = conn.get("name") or ""
+            if LOCAL_PATH.match(src):
+                add("data-connection", "the workbook carries a saved query to "
+                    "a path on one machine - a mapped drive or a share - so it "
+                    "refreshes for whoever set it up and for nobody else",
+                    "%s -> %s" % (label, src) if label else src)
+            elif src:
+                add("data-connection", "the workbook carries a saved query to "
+                    "an external source, so what it shows depends on something "
+                    "outside the file", "%s -> %s" % (label, src) if label
+                    else src)
 
     if any(n.startswith("xl/vbaProject") for n in names):
         add("legacy-macro", "the workbook contains a VBA project, so part of "

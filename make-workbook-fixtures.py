@@ -37,7 +37,15 @@ M = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 RNS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
-def book(sheets, defined_names="", extern=False):
+CONNECTIONS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<connections xmlns="%s"><connection id="1" name="RatesTemplate" '
+    'type="4" refreshedVersion="0" background="1"><webPr xml="1" '
+    'sourceData="1" url="N:\\_Templates\\rates\\RatesTemplate.xml" '
+    'htmlTables="1"/></connection></connections>')
+
+
+def book(sheets, defined_names="", extern=False, connections=False):
     """sheets: list of (name, state, xml). Returns the dict of zip members."""
     tabs = "".join(
         '<sheet name="%s" sheetId="%d" r:id="rId%d"%s/>'
@@ -61,8 +69,20 @@ def book(sheets, defined_names="", extern=False):
             'Path" Target="/old-server/finance/rates-2014.xlsx" '
             'TargetMode="External"/></Relationships>')
 
-    parts["[Content_Types].xml"] = CT % "".join(
-        SHEET_CT % (i + 1) for i in range(len(sheets)))
+    conn_ct = conn_rel = ""
+    if connections:
+        # A saved web query: the part, its content type and its relationship.
+        # The path is a mapped drive, which is the case the rule is about.
+        conn_rel = ('<Relationship Id="rIdC" Type="http://schemas.openxmlformats'
+                    '.org/officeDocument/2006/relationships/connections" '
+                    'Target="connections.xml"/>')
+        conn_ct = ('<Override PartName="/xl/connections.xml" ContentType='
+                   '"application/vnd.openxmlformats-officedocument'
+                   '.spreadsheetml.connections+xml"/>\n')
+        parts["xl/connections.xml"] = CONNECTIONS % M
+
+    parts["[Content_Types].xml"] = CT % ("".join(
+        SHEET_CT % (i + 1) for i in range(len(sheets))) + conn_ct)
     parts["_rels/.rels"] = ROOT_RELS
     parts["xl/workbook.xml"] = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
@@ -75,7 +95,7 @@ def book(sheets, defined_names="", extern=False):
         % ("".join('<Relationship Id="rId%d" Type="http://schemas.openxmlformats'
                    '.org/officeDocument/2006/relationships/worksheet" '
                    'Target="worksheets/sheet%d.xml"/>' % (i + 1, i + 1)
-                   for i in range(len(sheets))), ext_rel))
+                   for i in range(len(sheets))), ext_rel + conn_rel))
     for i, (_, _, xml) in enumerate(sheets):
         parts["xl/worksheets/sheet%d.xml" % (i + 1)] = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
@@ -138,7 +158,7 @@ dirty = book(
      ("Checks", "visible", CLEAN_IN_DIRTY)],
     defined_names=('<definedNames><definedName name="margin">#REF!'
                    '</definedName></definedNames>'),
-    extern=True)
+    extern=True, connections=True)
 write(os.path.join(out, "dirty.xlsx"), dirty)
 
 CLEAN = rows([("A1", "<v>7</v>"), ("B1", "<f>A1*1.2</f><v>8.4</v>")],
