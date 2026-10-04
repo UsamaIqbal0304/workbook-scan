@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Usama Iqbal (Plantroom Labs)
 """What a spreadsheet actually does, read out of the file rather than Excel.
 
     ./workbook-scan.py BOOK.xlsx [BOOK2.xlsx ...]
